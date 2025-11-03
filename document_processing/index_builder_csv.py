@@ -11,8 +11,8 @@ from document_processing.hypothetical_prompt_embeddings import (
 )
 import traceback
 
-from qdrant_client import QdrantClient
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from qdrant_client import QdrantClient, models
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client.models import PointStruct
 import config
 
@@ -26,7 +26,9 @@ class UnifiedDocumentChunk:
     page_number: int
     metadata: Dict[str, Any]
     hypothetical_questions: List[str]
-    embedding: Optional[List[float]]
+    dense_embedding: Optional[List[float]]
+    sparse_embedding_indices: Optional[List[int]]
+    sparse_embedding_weights: Optional[List[float]]
 
 
 class unifiedDocumentIndexBuilder:
@@ -34,13 +36,15 @@ class unifiedDocumentIndexBuilder:
     Builds unified format indexes from documents using HyPE system with single embeddings per chunk
     """
 
-    def __init__(self, embedding_model: str):
+    def __init__(self, embedding_model_name: str, bedrock_client):
 
-        self.question_generator = HypeQuestionGenerator()
-        self.embedding_system = HypeEmbeddingSystem(embedding_model)
+        self.question_generator = HypeQuestionGenerator(bedrock_client=bedrock_client)
+        self.embedding_system = HypeEmbeddingSystem(
+            embedding_model_name, bedrock_client
+        )
         self.embedding_dimension = 1024
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800, chunk_overlap=150, separators=["\n\n", "\n", ". ", " "]
+            chunk_size=1000, chunk_overlap=150, separators=["\n\n", "\n", ". ", " "]
         )
         self.qdrant = QdrantClient(
             url="https://245be38a-1058-482a-9639-4b4ddd802aec.us-east-1-1.aws.cloud.qdrant.io",
@@ -68,7 +72,9 @@ class unifiedDocumentIndexBuilder:
                             "chunk_index": c_idx,
                         },
                         hypothetical_questions=[],
-                        embedding=None,
+                        dense_embedding=None,
+                        sparse_embedding_weights=None,
+                        sparse_embedding_indices=None,
                     )
                     chunks.append(chunk)
 
@@ -139,7 +145,7 @@ class unifiedDocumentIndexBuilder:
             print(f"Failed to create unified text for {chunk.chunk_id}: {e}")
             return chunk.chunk_content
 
-    def _create_embeddings(
+    def _create_sparse_and_dense_embeddings(
         self, chunks: List[UnifiedDocumentChunk]
     ) -> List[UnifiedDocumentChunk]:
 
@@ -147,10 +153,21 @@ class unifiedDocumentIndexBuilder:
             unified_content = self._get_unified_chunk_content(chunk)
             chunk.chunk_content = unified_content
             print("[UNIFIED CONTENT]", unified_content)
-            embedding = self.embedding_system._get_single_embedding(unified_content)
-            if hasattr(embedding, "tolist"):
-                embedding = embedding.tolist()
-            chunk.embedding = embedding
+            dense_embedding = self.embedding_system._get_single_dense_embedding(
+                unified_content
+            )
+            sparse_embedding, _ = self.embedding_system._get_single_sparse_embedding(
+                unified_content
+            )
+            sparse_embedding_indices = (
+                sparse_embedding.nonzero().numpy().flatten().tolist()
+            )
+            sparse_embedding_values = (
+                sparse_embedding.detach().numpy()[sparse_embedding_indices].tolist()
+            )
+            chunk.dense_embedding = dense_embedding
+            chunk.sparse_embedding_indices = sparse_embedding_indices
+            chunk.sparse_embedding_weights = sparse_embedding_values
         return chunk
 
     def _create_index(self, chunks: List[UnifiedDocumentChunk]) -> bool:
@@ -160,7 +177,13 @@ class unifiedDocumentIndexBuilder:
             points = [
                 PointStruct(
                     id=str(uuid.uuid4()),
-                    vector=chunk.embedding,
+                    vector={
+                        "denseV": chunk.dense_embedding,
+                        "sparseV": models.SparseVector(
+                            indices=chunk.sparse_embedding_indices,
+                            values=chunk.sparse_embedding_weights,
+                        ),
+                    },
                     payload={
                         "chunk_id": chunk.chunk_id,
                         "chunk_content": chunk.chunk_content,
@@ -172,7 +195,7 @@ class unifiedDocumentIndexBuilder:
                 for chunk in chunks
             ]
             print(self.qdrant.get_collections())
-            self.qdrant.upload_points(collection_name="rag_pdf_chunks", points=points)
+            self.qdrant.upload_points(collection_name="test", points=points)
             print("index created successfully")
             return True
         except Exception as e:
@@ -198,7 +221,7 @@ class unifiedDocumentIndexBuilder:
                     else:
                         print(f"unsupported file type")
                 except Exception as e:
-                    print(f"Error occured while trying to process file")
+                    print(f"Error occured while trying to process file: {e}")
                     failed_docs.append(file_path.name)
 
         if not all_chunks:
@@ -207,7 +230,7 @@ class unifiedDocumentIndexBuilder:
 
         all_chunks = self._generate_hype_questions_for_chunks(chunks)
 
-        all_chunks = self._create_embeddings(chunks)
+        all_chunks = self._create_sparse_and_dense_embeddings(chunks)
 
         outcome = self._create_index(chunks)
 

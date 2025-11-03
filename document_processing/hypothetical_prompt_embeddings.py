@@ -14,10 +14,14 @@ Key Features:
 5. Lambda-friendly with no runtime overhead
 """
 import re
+import json
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 from config import LLM_HYPE, EMBEDDING_MODEL_NAME, HUGGING_FACE_API
 from huggingface_hub import InferenceClient
+from langchain_aws import ChatBedrockConverse
+from transformers import AutoModelForMaskedLM, AutoTokenizer
+import torch
 
 
 @dataclass
@@ -45,24 +49,48 @@ class HypeIndex:
 class HypeEmbeddingSystem:
     """Embedding system"""
 
-    def __init__(self, embedding_model: str):
-        self.embedding_model = embedding_model
+    def __init__(self, embedding_model: str, bedrock_client=None):
+        self.embedding_model_name = embedding_model
         self.embedding_dimension = 1024
-        self.embedder = client = InferenceClient(
-            provider="hf-inference",
-            model=self.embedding_model,
-            token=HUGGING_FACE_API,
-        )
+        self.embedder = bedrock_client
+        self.splade_model_id = "naver/splade-cocondenser-ensembledistil"
+        self.splade_tokenizer = AutoTokenizer.from_pretrained(self.splade_model_id)
+        self.splade_model = AutoModelForMaskedLM.from_pretrained(self.splade_model_id)
 
-    def _get_single_embedding(self, text: str) -> List[float]:
+    def _get_single_dense_embedding(self, text: str) -> List[float]:
         try:
-            embedding_result = self.embedder.feature_extraction(
-                text=text, normalize=True, truncate=True
+            body = {
+                "inputText": text,
+                "dimensions": self.embedding_dimension,
+                "normalize": True,
+            }
+
+            response = self.embedder.invoke_model(
+                modelId=self.embedding_model_name,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(body),
             )
-            return embedding_result
+
+            response_body = json.loads(response["body"].read())
+            print("[Genertaed embedding]:", response_body)
+            print("\n")
+            print("\n")
+            return response_body["embedding"]
         except Exception as e:
             print("Exceptionoccured while embedding:", e)
             return [0.0] * self.embedding_dimension
+
+    def _get_single_sparse_embedding(self, text: str):
+        tokens = self.splade_tokenizer(text, return_tensors="pt")
+        output = self.splade_model(**tokens)
+        logits, attention_mask = output.logits, tokens.attention_mask
+        relu_log = torch.log(1 + torch.relu(logits))
+        weighted_log = relu_log * attention_mask.unsqueeze(-1)
+        max_val, _ = torch.max(weighted_log, dim=1)
+        vec = max_val.squeeze()
+
+        return vec, tokens
 
 
 class HypeQuestionGenerator:
@@ -70,8 +98,10 @@ class HypeQuestionGenerator:
     Generates Hypothetical questions using domain-specific prompts
     """
 
-    def __init__(self):
-        self.llm = LLM_HYPE
+    def __init__(self, bedrock_client=None):
+        self.llm = ChatBedrockConverse(
+            model_id="anthropic.claude-3-haiku-20240307-v1:0", client=bedrock_client
+        )
         self.question_templates = {
             "factual": [
                 "What specific information is provided about {topic}?",
